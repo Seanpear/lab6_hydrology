@@ -1,26 +1,317 @@
 ---
-title: "lab6"
+title: "Lab 6 ML Workflows"
+author: "Sean Pearson"
+date: "2025-04-05"
 format: html
-editor: visual
+execute: 
+  echo: true
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
 ```{r}
-1 + 1
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+```
+```{r}
+# Download the CAMELS documentation PDF
+download.file(
+  url = "https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf",
+  destfile = "data/camels_attributes_v2.0.pdf",
+  mode = "wb"
+)
 ```
 
-You can add options to executable code like this
-
 ```{r}
-#| echo: false
-2 * 2
+# Define the file types we want
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+# Root URL and file paths
+root <- "https://gdex.ucar.edu/dataset/camels/file"
+remote_files <- glue("{root}/camels_{types}.txt")
+local_files  <- glue("data/camels_{types}.txt")
+
+# Download each .txt file to the data folder
+walk2(remote_files, local_files, ~ download.file(.x, .y, quiet = TRUE))
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r}
+# Read each .txt file 
+camels_list <- map(local_files, ~ read_delim(.x, show_col_types = FALSE))
+```
+
+```{r}
+# Merge all data frames 
+camels <- power_full_join(camels_list, by = "gauge_id")
+```
+
+## Question 1:
+
+#### Part 1: From the documentation PDF, report what zero_q_freq represents
+
+This represents the frequency of days with Q = 0 mm/day. In other words, the percentage of days in the streamflow record when streamflow was zero at the gauge. 
+
+## Question 2:
+```{r}
+library(ggplot2)
+library(patchwork)
+library(maps)
+library(ggthemes)
+```
+
+```{r}
+# Add US state borders
+base_map <- borders("state", colour = "gray50")
+```
+#### Part 1: Create Aridity Map
+```{r}
+# Map 1: Color by aridity
+map_aridity <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  base_map +
+  geom_point(aes(color = aridity)) +
+  scale_color_gradient(low = "lightyellow", high = "darkred") +
+  ggtitle("Site Aridity") +
+  theme_map()
+```
+#### Part 2: Create p_mean Map
+```{r}
+# Map 2: Color by p_mean 
+map_pmean <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  base_map +
+  geom_point(aes(color = p_mean)) +
+  scale_color_gradient(low = "lightblue", high = "darkblue") +
+  ggtitle("Mean Precipitation (p_mean)") +
+  theme_map()
+```
+#### Part 3: Combine the Maps 
+```{r}
+# Combine the two plots sidebyside
+map_aridity + map_pmean
+```
+
+## Question 3:
+
+```{r}
+# Load if not already
+library(xgboost)
+library(ranger)
+```
+
+```{r}
+# Make sure logQmean exists
+camels <- camels %>%
+  mutate(logQmean = log(q_mean))
+```
+
+```{r}
+# Split the data
+set.seed(123)
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+```
+
+```{r}
+# 10-fold CV
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+
+```{r setup-recipe}
+rec <- recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ aridity:p_mean) %>%
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+```{r}
+# Linear regression
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+```
+
+```{r}
+# Random forest
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+```
+
+#### Part 1: Build an xgboost Model
+```{r}
+# XGBoost
+xgb_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+#### Part 2: Build a Neural Network Model
+```{r}
+# Neural Net via bagged MLP
+nnet_model <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+```
+
+#### Part 3: Add All Four Models to Workflow
+```{r}
+wf <- workflow_set(
+  preproc = list(rec),
+  models = list(
+    linear_reg = lm_model,
+    random_forest = rf_model,
+    xgboost = xgb_model,
+    neural_net = nnet_model
+  )
+) %>%
+  workflow_map("fit_resamples", resamples = camels_cv)
+```
+
+#### Part 4: Compare Model Performance and Evaluation
+```{r}
+# Plot performance across models
+autoplot(wf)
+
+# Rank by R²
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+ Model Evaluation and Comparison I compared four models: linear regression, random forest, xgboost, and a neural network. The neural network model (bag_mlp) performed the best, with the lowest RMSE (0.557) and highest r-squared (0.782). This means it made the most accurate predictions and explained the most variation in the data. Random forest came in second, followed by linear regression. xgboost had the lowest performance. Based on this, I would choose the neural network model to move forward with.
+
+#### Part 5: Conclusion
+Based on my results, the model I should move forward with is bag_mlp. 
+
+## Build Your Own:
+
+#### Part 1: Data Splitting
+```{r}
+# Set seed
+set.seed(42)  # New seed to show it’s a different split
+```
+
+```{r}
+# Create log-transformed target variable
+camels <- camels %>%
+  mutate(logQmean = log(q_mean))
+```
+
+```{r}
+# New 75/25 split for Build Your Own section
+camels_split_byo <- initial_split(camels, prop = 0.75)
+camels_train_byo <- training(camels_split_byo)
+camels_test_byo  <- testing(camels_split_byo)
+```
+
+```{r}
+# New 10-fold CV
+camels_cv_byo <- vfold_cv(camels_train_byo, v = 10)
+```
+
+#### Part 2: Recipe
+I will be using the formula logQmean ~ p_mean + pet_mean + slope_mean + frac_forest. I chose this formula because these variables because they all affect how much water flows in a river:
+
+- p_mean = how much rain falls  
+- pet_mean = how much water goes back into the air  
+- slope_mean = how steep the land is  
+- frac_forest = how much of the land is covered by trees
+
+These things all impact how much water ends up in the stream, so they help predict streamflow.
+
+```{r}
+rec_byo <- recipe(logQmean ~ p_mean + pet_mean + slope_mean + frac_forest, data = camels_train_byo) %>%
+  step_mutate(frac_forest = ifelse(is.finite(frac_forest), frac_forest, NA)) %>%
+  step_naomit(all_predictors(), all_outcomes()) %>%
+  step_normalize(all_predictors())
+```
+
+#### Part 3: Define 3 Models 
+
+```{r}
+# Random Forest model
+rf_model_byo <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+```
+
+```{r}
+# XGBoost model
+xgb_model_byo <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+```{r}
+# Neural Network (bagged MLP) model
+nnet_model_byo <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+```
+
+#### Part 4: Workflow Set
+
+```{r}
+# Create a named list of models
+models_byo <- list(
+  random_forest = rf_model_byo,
+  xgboost = xgb_model_byo,
+  neural_net = nnet_model_byo
+)
+
+# Create a workflow set using the same recipe for all models
+wf_byo <- workflow_set(
+  preproc = list(recipe = rec_byo),
+  models  = models_byo
+)
+
+# Fit all models to 10-fold CV resamples
+wf_byo_results <- wf_byo %>%
+  workflow_map("fit_resamples", resamples = camels_cv_byo)
+```
+
+#### Part 5: Evaluation
+
+```{r}
+# Visualize performance
+autoplot(wf_byo_results)
+
+# Show best model by R-squared
+rank_results(wf_byo_results, rank_metric = "rsq", select_best = TRUE)
+```
+
+Based on the results I can conclude that bag_mlp is the most accurate model. This is due to the fact that it has the lowest rmse and highest r-squared. Low rmse values mean better predictions and r-squared values that are near 1 better fit the model. 
+
+#### Step 6: Extract and Evaluate
+```{r}
+# Build a workflow with the best model and recipe
+final_wf <- workflow() %>%
+  add_model(nnet_model_byo) %>%   # bag_mlp model you defined earlier
+  add_recipe(rec_byo)             # recipe you built earlier
+```
+
+```{r}
+# Fit the model to all training data
+final_fit <- fit(final_wf, data = camels_train_byo)
+```
+
+```{r}
+# Predict on the test data
+final_preds <- augment(final_fit, new_data = camels_test_byo)
+```
+
+```{r}
+# Plot observed vs predicted values
+ggplot(final_preds, aes(x = logQmean, y = .pred, color = frac_forest)) +
+  geom_point() +
+  geom_abline(linetype = "dashed", color = "black") +
+  scale_color_viridis_c() +
+  labs(
+    title = "Observed vs Predicted Log Mean Streamflow (Bagged MLP)",
+    x = "Observed logQmean",
+    y = "Predicted logQmean",
+    color = "Fraction Forest"
+  ) +
+  theme_minimal()
+```
+
+The bagged MLP model did a great job predicting mean streamflow. Most of the points are close to the dashed line, which means the predictions are very similar to the real values. The color scale (Fraction Forest) also looks well spread out, so the model seems to work across different land cover types. Overall, the model looks accurate and should do well predicting streamflow in similar places.
